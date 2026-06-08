@@ -7,9 +7,135 @@ import logging
 from typing import Dict, List, Any, Optional
 from utils.graph_client import GraphClient
 from msgraph.generated.models.application import Application
+from msgraph.generated.models.web_application import WebApplication
+from msgraph.generated.models.api_application import ApiApplication
+from msgraph.generated.models.public_client_application import PublicClientApplication
+from msgraph.generated.models.spa_application import SpaApplication
+from msgraph.generated.models.implicit_grant_settings import ImplicitGrantSettings
+from msgraph.generated.models.permission_scope import PermissionScope
+from msgraph.generated.models.required_resource_access import RequiredResourceAccess
+from msgraph.generated.models.resource_access import ResourceAccess
 from .service_principals import get_service_principal_by_app_id
 
 logger = logging.getLogger(__name__)
+
+
+def _build_web_application(data: Any) -> WebApplication:
+    """Coerce a dict (or pass through a model) into a WebApplication."""
+    if isinstance(data, WebApplication):
+        return data
+    web = WebApplication()
+    if 'redirectUris' in data:
+        web.redirect_uris = data['redirectUris']
+    if 'homePageUrl' in data:
+        web.home_page_url = data['homePageUrl']
+    if 'logoutUrl' in data:
+        web.logout_url = data['logoutUrl']
+    if 'implicitGrantSettings' in data and data['implicitGrantSettings'] is not None:
+        igs_data = data['implicitGrantSettings']
+        igs = ImplicitGrantSettings()
+        if 'enableAccessTokenIssuance' in igs_data:
+            igs.enable_access_token_issuance = igs_data['enableAccessTokenIssuance']
+        if 'enableIdTokenIssuance' in igs_data:
+            igs.enable_id_token_issuance = igs_data['enableIdTokenIssuance']
+        web.implicit_grant_settings = igs
+    return web
+
+
+def _build_redirect_uri_app(cls, data: Any):
+    """Coerce a dict into a PublicClientApplication or SpaApplication (redirectUris only)."""
+    if isinstance(data, cls):
+        return data
+    obj = cls()
+    if 'redirectUris' in data:
+        obj.redirect_uris = data['redirectUris']
+    return obj
+
+
+def _build_api_application(data: Any) -> ApiApplication:
+    """Coerce a dict (or pass through a model) into an ApiApplication."""
+    if isinstance(data, ApiApplication):
+        return data
+    api = ApiApplication()
+    if 'acceptMappedClaims' in data:
+        api.accept_mapped_claims = data['acceptMappedClaims']
+    if 'requestedAccessTokenVersion' in data:
+        api.requested_access_token_version = data['requestedAccessTokenVersion']
+    if 'knownClientApplications' in data:
+        api.known_client_applications = data['knownClientApplications']
+    if 'oauth2PermissionScopes' in data and data['oauth2PermissionScopes'] is not None:
+        scopes = []
+        for s in data['oauth2PermissionScopes']:
+            if isinstance(s, PermissionScope):
+                scopes.append(s)
+                continue
+            scope = PermissionScope()
+            scope.id = s.get('id')
+            scope.value = s.get('value')
+            scope.type = s.get('type')
+            scope.is_enabled = s.get('isEnabled')
+            scope.admin_consent_display_name = s.get('adminConsentDisplayName')
+            scope.admin_consent_description = s.get('adminConsentDescription')
+            scope.user_consent_display_name = s.get('userConsentDisplayName')
+            scope.user_consent_description = s.get('userConsentDescription')
+            scopes.append(scope)
+        api.oauth2_permission_scopes = scopes
+    return api
+
+
+def _build_required_resource_access(items: Any) -> List[RequiredResourceAccess]:
+    """Coerce a list of dicts into a list of RequiredResourceAccess models."""
+    result: List[RequiredResourceAccess] = []
+    for item in items or []:
+        if isinstance(item, RequiredResourceAccess):
+            result.append(item)
+            continue
+        rra = RequiredResourceAccess()
+        rra.resource_app_id = item.get('resourceAppId')
+        resource_access = []
+        for ra in item.get('resourceAccess', []) or []:
+            if isinstance(ra, ResourceAccess):
+                resource_access.append(ra)
+                continue
+            access = ResourceAccess()
+            access.id = ra.get('id')
+            access.type = ra.get('type')
+            resource_access.append(access)
+        rra.resource_access = resource_access
+        result.append(rra)
+    return result
+
+
+def _apply_app_data(app: Application, app_data: Dict[str, Any]) -> Application:
+    """Apply a plain-dict app payload onto an Application model, coercing nested
+    object/array fields into their typed Kiota models.
+
+    Assigning raw dicts to fields like ``app.web`` / ``app.api`` /
+    ``app.required_resource_access`` makes request serialization fail with
+    ``'dict' object has no attribute 'serialize'`` because the Graph SDK calls
+    ``.serialize()`` on each field. Coercing here avoids that.
+    """
+    if 'displayName' in app_data:
+        app.display_name = app_data['displayName']
+    if 'signInAudience' in app_data:
+        app.sign_in_audience = app_data['signInAudience']
+    if 'tags' in app_data:
+        app.tags = app_data['tags']
+    if 'identifierUris' in app_data:
+        app.identifier_uris = app_data['identifierUris']
+    if 'isFallbackPublicClient' in app_data:
+        app.is_fallback_public_client = app_data['isFallbackPublicClient']
+    if 'web' in app_data and app_data['web'] is not None:
+        app.web = _build_web_application(app_data['web'])
+    if 'api' in app_data and app_data['api'] is not None:
+        app.api = _build_api_application(app_data['api'])
+    if 'publicClient' in app_data and app_data['publicClient'] is not None:
+        app.public_client = _build_redirect_uri_app(PublicClientApplication, app_data['publicClient'])
+    if 'spa' in app_data and app_data['spa'] is not None:
+        app.spa = _build_redirect_uri_app(SpaApplication, app_data['spa'])
+    if 'requiredResourceAccess' in app_data and app_data['requiredResourceAccess'] is not None:
+        app.required_resource_access = _build_required_resource_access(app_data['requiredResourceAccess'])
+    return app
 
 async def list_applications(graph_client: GraphClient, limit: int = 100) -> List[Dict[str, Any]]:
     """List all applications (app registrations) in the tenant, with paging."""
@@ -121,22 +247,7 @@ async def create_application(graph_client: GraphClient, app_data: Dict[str, Any]
     """Create a new application (app registration)."""
     try:
         client = graph_client.get_client()
-        app = Application()
-        # Set properties from app_data
-        if 'displayName' in app_data:
-            app.display_name = app_data['displayName']
-        if 'signInAudience' in app_data:
-            app.sign_in_audience = app_data['signInAudience']
-        if 'tags' in app_data:
-            app.tags = app_data['tags']
-        if 'identifierUris' in app_data:
-            app.identifier_uris = app_data['identifierUris']
-        if 'web' in app_data:
-            app.web = app_data['web']
-        if 'api' in app_data:
-            app.api = app_data['api']
-        if 'requiredResourceAccess' in app_data:
-            app.required_resource_access = app_data['requiredResourceAccess']
+        app = _apply_app_data(Application(), app_data)
         new_app = await client.applications.post(app)
         if new_app:
             return {
@@ -157,22 +268,7 @@ async def update_application(graph_client: GraphClient, app_id: str, app_data: D
     """Update an existing application (app registration)."""
     try:
         client = graph_client.get_client()
-        app = Application()
-        # Set updatable properties from app_data
-        if 'displayName' in app_data:
-            app.display_name = app_data['displayName']
-        if 'signInAudience' in app_data:
-            app.sign_in_audience = app_data['signInAudience']
-        if 'tags' in app_data:
-            app.tags = app_data['tags']
-        if 'identifierUris' in app_data:
-            app.identifier_uris = app_data['identifierUris']
-        if 'web' in app_data:
-            app.web = app_data['web']
-        if 'api' in app_data:
-            app.api = app_data['api']
-        if 'requiredResourceAccess' in app_data:
-            app.required_resource_access = app_data['requiredResourceAccess']
+        app = _apply_app_data(Application(), app_data)
         await client.applications.by_application_id(app_id).patch(app)
         # Return the updated application
         return await get_application_by_id(graph_client, app_id)
