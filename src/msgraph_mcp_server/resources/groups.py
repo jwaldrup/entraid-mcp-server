@@ -5,9 +5,11 @@ This module provides access to Microsoft Graph group resources.
 
 import logging
 from typing import Dict, List, Any, Optional
+from kiota_abstractions.api_error import APIError
 from msgraph.generated.groups.groups_request_builder import GroupsRequestBuilder
 from msgraph.generated.models.group import Group
 from msgraph.generated.models.directory_object import DirectoryObject
+from msgraph.generated.models.reference_create import ReferenceCreate
 from utils.graph_client import GraphClient
 
 logger = logging.getLogger(__name__)
@@ -364,25 +366,29 @@ async def add_group_member(graph_client: GraphClient, group_id: str, member_id: 
         if group and group.group_types and 'DynamicMembership' in group.group_types:
             logger.warning(f"Cannot add members to dynamic group {group_id}")
             raise ValueError("Cannot add members to a dynamic membership group. Members are determined by the membership rule.")
-        
-        # Check if member is already in the group
-        try:
-            # This will raise an exception if member is not found
-            existing_member = await client.groups.by_group_id(group_id).members.by_directory_object_id(member_id).get()
-            if existing_member:
-                logger.info(f"Member {member_id} is already in group {group_id}")
-                return True
-        except Exception:
-            # Member is not in the group, continue with adding
-            pass
-        
+
         # Create a reference to the directory object (member)
-        directory_object = DirectoryObject()
-        directory_object.id = member_id
-        
-        # Add the member to the group
-        await client.groups.by_group_id(group_id).members.ref.post(directory_object)
-        
+        reference_create = ReferenceCreate()
+        reference_create.odata_id = f"https://graph.microsoft.com/v1.0/directoryObjects/{member_id}"
+
+        # Add the member to the group.
+        #
+        # Note: there is no supported Graph route to GET a single member by id
+        # (GET /groups/{id}/members/{member-id} is not valid), so we do NOT
+        # pre-check membership. We perform the write directly and treat the
+        # "already a member" error as idempotent success.
+        try:
+            await client.groups.by_group_id(group_id).members.ref.post(reference_create)
+        except APIError as e:
+            # Adding an existing member returns HTTP 400 with a message indicating
+            # the reference already exists. Treat that as idempotent success.
+            message = (e.message or str(e)).lower()
+            if e.response_status_code == 400 and ("already exist" in message or "added object references already exist" in message):
+                logger.info(f"Member {member_id} is already in group {group_id}; treating add as success (idempotent)")
+                return True
+            # Any other error is a real failure.
+            raise
+
         return True
     except Exception as e:
         logger.error(f"Error adding member {member_id} to group {group_id}: {str(e)}")
@@ -407,18 +413,24 @@ async def remove_group_member(graph_client: GraphClient, group_id: str, member_i
         if group and group.group_types and 'DynamicMembership' in group.group_types:
             logger.warning(f"Cannot remove members from dynamic group {group_id}")
             raise ValueError("Cannot remove members from a dynamic membership group. Members are determined by the membership rule.")
-        
-        # Check if member exists in the group
+
+        # Remove the member from the group via the $ref endpoint.
+        #
+        # IMPORTANT: do NOT pre-check membership with
+        # GET /groups/{id}/members/{member-id} -- that single-member-by-id route
+        # is not a supported Graph route and ALWAYS raises, which previously made
+        # this function return success without ever performing the delete
+        # (DEV-2460). We perform the delete directly and treat a 404 (member not
+        # in the group) as idempotent success.
         try:
-            # This will raise an exception if member is not found
-            await client.groups.by_group_id(group_id).members.by_directory_object_id(member_id).get()
-        except Exception as e:
-            logger.info(f"Member {member_id} not found in group {group_id}: {str(e)}")
-            return True  # Already not a member, so removal "succeeded"
-        
-        # Remove the member from the group
-        await client.groups.by_group_id(group_id).members.by_directory_object_id(member_id).ref.delete()
-        
+            await client.groups.by_group_id(group_id).members.by_directory_object_id(member_id).ref.delete()
+        except APIError as e:
+            if e.response_status_code == 404:
+                logger.info(f"Member {member_id} not found in group {group_id}; treating removal as success (idempotent)")
+                return True  # Already not a member, so removal succeeded.
+            # Any other error is a real failure - do NOT report false success.
+            raise
+
         return True
     except Exception as e:
         logger.error(f"Error removing member {member_id} from group {group_id}: {str(e)}")
@@ -437,14 +449,23 @@ async def add_group_owner(graph_client: GraphClient, group_id: str, owner_id: st
     """
     try:
         client = graph_client.get_client()
-        
-        # Create a reference to the directory object (owner)
-        directory_object = DirectoryObject()
-        directory_object.id = owner_id
-        
-        # Add the owner to the group
-        await client.groups.by_group_id(group_id).owners.ref.post(directory_object)
-        
+
+        # Create a reference to the directory object (owner). The owners $ref
+        # endpoint expects a ReferenceCreate body (an @odata.id pointing at the
+        # directory object), not a bare DirectoryObject.
+        reference_create = ReferenceCreate()
+        reference_create.odata_id = f"https://graph.microsoft.com/v1.0/directoryObjects/{owner_id}"
+
+        # Add the owner to the group. Treat "already an owner" as idempotent success.
+        try:
+            await client.groups.by_group_id(group_id).owners.ref.post(reference_create)
+        except APIError as e:
+            message = (e.message or str(e)).lower()
+            if e.response_status_code == 400 and ("already exist" in message or "added object references already exist" in message):
+                logger.info(f"Owner {owner_id} is already an owner of group {group_id}; treating add as success (idempotent)")
+                return True
+            raise
+
         return True
     except Exception as e:
         logger.error(f"Error adding owner {owner_id} to group {group_id}: {str(e)}")
@@ -463,10 +484,17 @@ async def remove_group_owner(graph_client: GraphClient, group_id: str, owner_id:
     """
     try:
         client = graph_client.get_client()
-        
-        # Remove the owner from the group
-        await client.groups.by_group_id(group_id).owners.by_directory_object_id(owner_id).ref.delete()
-        
+
+        # Remove the owner from the group. Treat a 404 (already not an owner) as
+        # idempotent success; any other error is a real failure.
+        try:
+            await client.groups.by_group_id(group_id).owners.by_directory_object_id(owner_id).ref.delete()
+        except APIError as e:
+            if e.response_status_code == 404:
+                logger.info(f"Owner {owner_id} not found on group {group_id}; treating removal as success (idempotent)")
+                return True
+            raise
+
         return True
     except Exception as e:
         logger.error(f"Error removing owner {owner_id} from group {group_id}: {str(e)}")
