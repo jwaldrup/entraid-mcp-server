@@ -48,17 +48,16 @@ async def get_managed_devices_by_user(graph_client: GraphClient, user_id: str) -
     """Get all managed devices for a specific userId, with paging support."""
     try:
         client = graph_client.get_client()
-        query_params = ManagedDevicesRequestBuilder.ManagedDevicesRequestBuilderGetQueryParameters(
-            filter=f"userId eq '{user_id}'"
-        )
-        request_configuration = RequestConfiguration(query_parameters=query_params)
-        request_configuration.headers.add("ConsistencyLevel", "eventual")
-        response = await client.device_management.managed_devices.get(request_configuration=request_configuration)
+        # Use the user's managedDevices navigation, not a $filter on the
+        # collection: Intune rejects `$filter=userId eq ...` with 400
+        # "Unsupported parameter", and it leaves userId empty on many devices.
+        devices_builder = client.users.by_user_id(user_id).managed_devices
+        response = await devices_builder.get()
         devices = []
         if response and response.value:
             devices.extend(response.value)
         while response is not None and getattr(response, 'odata_next_link', None):
-            response = await client.device_management.managed_devices.with_url(response.odata_next_link).get(request_configuration=request_configuration)
+            response = await devices_builder.with_url(response.odata_next_link).get()
             if response and response.value:
                 devices.extend(response.value)
         formatted_devices = []
